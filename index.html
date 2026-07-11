@@ -359,11 +359,24 @@ function renderTok(d) {
   p.hidden = false;
   p.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
+// ---- data loading: fresh from GitHub raw (updated by the crawler every hour),
+// falling back to the copy bundled with this deployment ----
+const RAW = 'https://raw.githubusercontent.com/smoke-user/rh-whales-public/main/';
+async function loadData(file) {
+  for (const base of [RAW, '']) {
+    try {
+      const r = await fetch(base + 'data/' + file + '?v=' + Math.floor(Date.now()/60000));
+      if (r.ok) return await r.json();
+    } catch (e) { /* next source */ }
+  }
+  throw new Error('data unavailable');
+}
+
 // ---- client-side token report (no backend: Blockscout + DexScreener + static data) ----
 const RH_BS = 'https://robinhoodchain.blockscout.com/api/v2';
 let TOKW = null;
 async function tokwDetail(a) {
-  if (!TOKW) TOKW = fetch('data/token_whales.json').then(r => r.json()).catch(() => ({tokens:{}}));
+  if (!TOKW) TOKW = loadData('token_whales.json').catch(() => ({tokens:{}}));
   const tw = await TOKW;
   return (tw.tokens || {})[a] || null;
 }
@@ -473,7 +486,7 @@ $('rows').addEventListener('click', e => {
   if (s) analyzeToken(s.dataset.addr);
 });
 
-fetch('data/whale_coins.json?v=' + Math.floor(Date.now()/60000)).then(r => r.json()).then(d => {
+loadData('whale_coins.json').then(d => {
   if (d.error) throw new Error(d.error);
   META = d;
   DATA = d.coins || [];
