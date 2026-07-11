@@ -383,6 +383,41 @@ async function tokwDetail(a) {
 async function jget(u) {
   try { const r = await fetch(u); if (!r.ok) return null; return await r.json(); } catch (e) { return null; }
 }
+// rug heuristics from bytecode via the public RPC (works for unverified contracts)
+const RH_RPC = 'https://rpc.mainnet.chain.robinhood.com';
+const RISKY_SELECTORS = [
+  ['40c10f19', 'bad',  'mint(address,uint256): владелец может печатать новые токены'],
+  ['a0712d68', 'bad',  'mint(uint256): эмиссия не зафиксирована'],
+  ['f9f92be4', 'bad',  'blacklist(address): кошельки могут заблокировать'],
+  ['8456cb59', 'warn', 'pause(): торговлю могут остановить'],
+  ['3659cfe6', 'warn', 'upgradeTo(): логику контракта могут подменить'],
+  ['69fe0e2d', 'warn', 'setFee(): комиссию могут изменить'],
+];
+async function rpc(method, params) {
+  try {
+    const r = await fetch(RH_RPC, {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({jsonrpc:'2.0', id:1, method, params})});
+    if (!r.ok) return null;
+    return (await r.json()).result ?? null;
+  } catch (e) { return null; }
+}
+async function bytecodeFlags(addr) {
+  const code = await rpc('eth_getCode', [addr, 'latest']);
+  if (!code || code === '0x') return [];
+  const flags = [];
+  for (const [sel, level, text] of RISKY_SELECTORS)
+    if (code.includes(sel)) flags.push({level, text: '⚙️ ' + text});
+  if (code.includes('f2fde38b')) {
+    const owner = await rpc('eth_call', [{to: addr, data: '0x8da5cb5b'}, 'latest']);
+    if (owner && owner.length === 66 && !/^0x0{64}$/.test(owner))
+      flags.push({level:'warn', text:`⚙️ Владелец контракта не отозван (0x${owner.slice(26,34)}…)`});
+    else if (owner && /^0x0{64}$/.test(owner))
+      flags.push({level:'info', text:'✅ Владелец контракта отозван (renounced)'});
+  }
+  if (!flags.some(f => f.level !== 'info'))
+    flags.push({level:'info', text:'✅ Байткод чистый: mint/blacklist/pause/upgrade не обнаружены'});
+  return flags;
+}
 function riskFlags(x) {
   const f = [];
   const liq = x.liquidity_usd, mcap = x.market_cap_usd;
@@ -403,12 +438,13 @@ function riskFlags(x) {
 }
 async function buildTokenReport(a) {
   const coin = DATA.find(c => c.address === a) || null;
-  const [detail, info, holders, contract, ds] = await Promise.all([
+  const [detail, info, holders, contract, ds, bflags] = await Promise.all([
     tokwDetail(a),
     jget(`${RH_BS}/tokens/${a}`),
     jget(`${RH_BS}/tokens/${a}/holders`),
     jget(`${RH_BS}/addresses/${a}`),
     jget(`https://api.dexscreener.com/latest/dex/tokens/${a}`),
+    bytecodeFlags(a),
   ]);
   if (!info && !coin) throw new Error('токен не найден на RobinhoodChain');
   const pairs = ((ds && ds.pairs) || []).filter(p => p.chainId === 'robinhood');
@@ -461,8 +497,9 @@ async function buildTokenReport(a) {
     explorer: `https://robinhoodchain.blockscout.com/token/${a}`,
     tax_note: 'Buy/sell tax не проверяется автоматически: для этого чейна нет honeypot-симуляторов. Смотри на флаги концентрации и ликвидности.',
   };
-  d.risk_flags = riskFlags(d);
-  d.risk_score = Math.max(0, 100 - d.risk_flags.reduce((s,f) => s + (f.level==='bad'?35:f.level==='warn'?15:5), 0));
+  d.risk_flags = riskFlags(d).concat(bflags || []);
+  d.risk_score = Math.max(0, 100 - d.risk_flags.reduce((s,f) =>
+    s + (f.text.startsWith('✅') ? 0 : f.level==='bad'?35:f.level==='warn'?15:5), 0));
   return d;
 }
 async function analyzeToken(addr) {
