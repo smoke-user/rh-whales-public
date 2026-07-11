@@ -393,13 +393,49 @@ const RISKY_SELECTORS = [
   ['3659cfe6', 'warn', 'upgradeTo(): логику контракта могут подменить'],
   ['69fe0e2d', 'warn', 'setFee(): комиссию могут изменить'],
 ];
-async function rpc(method, params) {
+async function rpcRaw(method, params) {
   try {
     const r = await fetch(RH_RPC, {method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({jsonrpc:'2.0', id:1, method, params})});
-    if (!r.ok) return null;
-    return (await r.json()).result ?? null;
-  } catch (e) { return null; }
+    if (!r.ok) return {err:true};
+    const j = await r.json();
+    if (j.error) { const m=(j.error.message||'').toLowerCase();
+      return (m.includes('revert')||m.includes('execution')) ? {reverted:true} : {err:true}; }
+    return {result: j.result ?? null};
+  } catch (e) { return {err:true}; }
+}
+async function rpc(method, params) { return (await rpcRaw(method, params)).result ?? null; }
+async function lpLockFlags(pairAddr) {
+  if (!pairAddr) return [];
+  const pool = await jget(`${RH_BS}/addresses/${pairAddr}`);
+  const ctx = pool && pool.creation_transaction_hash;
+  if (!ctx) return [];
+  const tt = await jget(`${RH_BS}/transactions/${ctx}/token-transfers`);
+  const nft = ((tt&&tt.items)||[]).find(t => ((t.token||{}).type||'').startsWith('ERC-721'));
+  if (!nft) return [];
+  const posm = (nft.token||{}).address_hash, id = (nft.total||{}).token_id;
+  if (!posm || id==null) return [];
+  let idHex; try { idHex = BigInt(id).toString(16).padStart(64,'0'); } catch(e){ return []; }
+  const owner = await rpc('eth_call', [{to:posm, data:'0x6352211e'+idHex}, 'latest']);
+  if (!owner || owner.length!==66) return [];
+  const o = ('0x'+owner.slice(26)).toLowerCase();
+  if (/^0x0+$/.test(o) || o==='0x000000000000000000000000000000000000dead')
+    return [{level:'info', text:'✅ LP-позиция сожжена — ликвидность заблокирована навсегда'}];
+  const oi = await jget(`${RH_BS}/addresses/${o}`);
+  if (oi && oi.is_contract)
+    return [{level:'info', text:`LP-позиция у контракта (${o.slice(0,8)}…) — вероятно локер/лаунчпад`}];
+  return [{level:'bad', text:`🔴 LP у обычного кошелька (${o.slice(0,8)}…) — ликвидность можно вывести в любой момент`}];
+}
+async function honeypotFlags(addr, holders) {
+  const h = ((holders&&holders.items)||[]).map(x=>x.address||{})
+    .find(a => a.hash && !a.is_contract && a.hash.toLowerCase()!=='0x000000000000000000000000000000000000dead');
+  if (!h) return [];
+  const data = '0xa9059cbb'+'1111111111111111111111111111111111111111'.padStart(64,'0')+(10n**18n).toString(16).padStart(64,'0');
+  const r = await rpcRaw('eth_call', [{from:h.hash, to:addr, data}, 'latest']);
+  if (r.reverted) return [{level:'bad', text:'🔴 Honeypot-тест: перевод токена revert-ит — переводы/продажи блокируются'}];
+  if (r.result && /1$/.test(r.result)) return [{level:'info', text:'✅ Honeypot-тест: перевод токена проходит (не блокирует)'}];
+  if (r.result==='0x' || (r.result && /0$/.test(r.result))) return [{level:'warn', text:'⚠️ Honeypot-тест: transfer вернул false'}];
+  return [];
 }
 async function bytecodeFlags(addr) {
   const code = await rpc('eth_getCode', [addr, 'latest']);
@@ -450,6 +486,7 @@ async function buildTokenReport(a) {
   const pairs = ((ds && ds.pairs) || []).filter(p => p.chainId === 'robinhood');
   pairs.sort((p, q) => ((q.liquidity||{}).usd||0) - ((p.liquidity||{}).usd||0));
   const pair = pairs[0] || null;
+  const [lpF, hpF] = await Promise.all([lpLockFlags(pair && pair.pairAddress), honeypotFlags(a, holders)]);
   const num = v => { const n = parseFloat(v); return Number.isFinite(n) ? n : null; };
   let top10 = null, topHolders = [];
   const supply = num(info && info.total_supply);
@@ -497,7 +534,7 @@ async function buildTokenReport(a) {
     explorer: `https://robinhoodchain.blockscout.com/token/${a}`,
     tax_note: 'Buy/sell tax не проверяется автоматически: для этого чейна нет honeypot-симуляторов. Смотри на флаги концентрации и ликвидности.',
   };
-  d.risk_flags = riskFlags(d).concat(bflags || []);
+  d.risk_flags = riskFlags(d).concat(bflags || [], lpF || [], hpF || []);
   d.risk_score = Math.max(0, 100 - d.risk_flags.reduce((s,f) =>
     s + (f.text.startsWith('✅') ? 0 : f.level==='bad'?35:f.level==='warn'?15:5), 0));
   return d;
